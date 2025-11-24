@@ -575,3 +575,255 @@ delete[] displs_y;
 ```
 
 ## Exercise 4: NBody Simulation
+
+In the last assignment the N-body simulation was implemented using OpenMP with shared memory. Parts of this code are reused here to implement the simple version of the simulation with MPI. This report will highlight differences between the previous version and how MPI integrates in this reworked implementation.
+
+### Replacing the Particle struct and creating a MPI Dataype for `Vector`
+
+Previously, the simulation stored particle data like position, velocity and mass in a single struct like this:
+
+```cpp
+struct Particle {
+    Vector Position;
+    Vector Velocity;
+    double Mass;
+};
+```
+
+For the MPI implementaiton, this was removed since MPI cannot reliably transmit arbitrary C++ structs. Instead, ithe simulation now stores the three properties in separate arrays:
+
+- `Vector positions[]`
+- `Vector velocities[]`
+- `double masses[]`
+
+For the `Vector` struct, a custom MPI datatype was created for the Vector struct which originally simply stored `x`, `y` and `z` coordinates like this:
+
+```cpp
+struct Vector {
+    double X;
+    double Y;
+    double Z;
+};
+```
+
+Because MPI needs to understand the layout of the transmitted data, a derived MPI datatype is created for the `Vector`. This datatype describes the struct field addresses and ensures arrays of `Vector` behave correctly during MPI communication operations. The implementation follows the code from the hint in the assignment slide:
+
+```cpp
+struct Vector {
+  double X;
+  double Y;
+  double Z;
+};
+
+MPI_Datatype mpi_vector_type;
+
+void build_vector_type() {
+  int blocklens[3] = { 1, 1, 1 };
+  MPI_Aint disps[3];
+  MPI_Datatype types[3] = { MPI_DOUBLE, MPI_DOUBLE, MPI_DOUBLE };
+
+  Vector probe{};
+  MPI_Aint base;
+  MPI_Get_address(&probe, &base);
+  MPI_Get_address(&probe.X, &disps[0]);
+  MPI_Get_address(&probe.Y, &disps[1]);
+  MPI_Get_address(&probe.Z, &disps[2]);
+  disps[0] -= base; disps[1] -= base; disps[2] -= base;
+
+  MPI_Datatype tmp;
+  MPI_Type_create_struct(3, blocklens, disps, types, &tmp);
+  // Ensure arrays of Vector advance by sizeof(Vector)
+  MPI_Type_create_resized(tmp, 0, sizeof(Vector), &mpi_vector_type);
+  MPI_Type_commit(&mpi_vector_type);
+  MPI_Type_free(&tmp);
+}
+```
+
+With this MPI type, arrays of Vector now can safely be sent using MPI collective functions like `MPI_Bcast` and `MPI_Scatterv`.
+
+### Initialization on Rank 0
+
+Rank 0 is the root process and therefore responsible to initialize all shared ressources. In this simulation it generates the masses, the initial positions and the initial velocities of the particles and writes this initial state to the output file:
+
+```cpp
+void generate_initial_state(Vector* positions, Vector* velocities, double* masses, int n) {
+    std::default_random_engine generator{ 42 };
+
+    std::lognormal_distribution<double> mass_distribution{ std::log(1e25), 0.8 };
+    std::uniform_real_distribution<double> position_distribution{ -1e11, +1e11 };
+    std::normal_distribution<double> velocity_distribution{ 0.0, 1e2 };
+
+    for (int q = 0; q < n; q++) {
+        masses[q] = mass_distribution(generator);
+
+        positions[q].X = position_distribution(generator);
+        positions[q].Y = position_distribution(generator);
+        positions[q].Z = position_distribution(generator);
+
+        velocities[q].X = velocity_distribution(generator);
+        velocities[q].Y = velocity_distribution(generator);
+        velocities[q].Z = velocity_distribution(generator);
+    }
+}
+
+int main(int argc, char** argv)
+{
+    MPI_Init(&argc, &argv);
+    build_vector_type();
+
+    int rank = 0, comm_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
+
+    ...
+
+    // global buffers (only filled on rank 0).
+    Vector* global_positions = new Vector[n_particles];
+    Vector* global_velocities = new Vector[n_particles];
+    double* masses = new double[n_particles];
+
+    std::ofstream out_file{ "n_body_simple_mpi.csv", std::ios::out };
+    if (rank == 0) {
+        write_header(out_file);
+        
+        generate_initial_state(global_positions, global_velocities, masses, n_particles);
+        
+        write_state(out_file, 0, 0.0, global_positions, masses, n_particles);
+    }
+
+    ...
+}
+```
+
+### Distribution of Particles
+
+While all processes receive the complete inital system in order to compute the forces in the first timestep, the particle range is then divided into blocks for updating. The distribution follows the same logic as in the exercise about matrix-vector multiplication:
+
+```cpp
+// distribute particles to processes
+int base_particles = n_particles / comm_size;
+int remaining_particles = n_particles % comm_size;
+int local_n = base_particles + (rank < remaining_particles ? 1 : 0);
+
+int* counts = new int[comm_size];
+int* displs = new int[comm_size];
+displs[0] = 0;
+for (int p = 0; p < comm_size; ++p) {
+    counts[p] = base_particles + (p < remaining_particles ? 1 : 0);
+    if (p > 0) displs[p] = displs[p - 1] + counts[p - 1];
+}
+
+...
+
+// local buffers
+Vector* local_positions = new Vector[local_n];
+Vector* local_velocities = new Vector[local_n];
+Vector* local_forces = new Vector[local_n];
+```
+
+All processes then receive the global initial state via broadcast:
+
+```cpp
+MPI_Bcast(masses, n_particles, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+// broadcast initial global_positions and velocities so every rank can compute forces in first step
+MPI_Bcast(global_positions, n_particles, mpi_vector_type, 0, MPI_COMM_WORLD);
+MPI_Bcast(global_velocities, n_particles, mpi_vector_type, 0, MPI_COMM_WORLD);
+```
+
+And finally, each process reveives its local slice of their particle positions and velocities using `MPI_Scatterv`:
+
+```cpp
+// copy initial local slices from global arrays (local view)
+MPI_Scatterv(global_positions, counts, displs, mpi_vector_type,
+    local_positions, counts[rank], mpi_vector_type, 0, MPI_COMM_WORLD);
+
+MPI_Scatterv(global_velocities, counts, displs, mpi_vector_type,
+    local_velocities, counts[rank], mpi_vector_type, 0, MPI_COMM_WORLD);
+```
+
+### Local computation
+
+After initialization and distribution, each process is now responsible for computing the dynamics of its assigned subset of particles. Even though particles are divided among the ranks, every process still requires the full set of global positions and masses in order to compute the gravitational forces between them. This is why all ranks maintain a synchronized copy of the global arrays, while only updating the particles they are responsible for.
+
+Each process iterates its assigned particles and calculates the force acting on a particle. To correctly update a particle, its global index is needed, which can be calculated by simply combining the displacement of the process with the local loop counter like `int global_index = displs[rank] + i`.
+
+The function `compute_local_forces` uses the full `global_positions` and `masses` to compute the gravitational influence of all bodies, but only stores results for the rank's local particles.
+
+```cpp
+for (int step = 1; step <= n_steps; ++step) {
+    double current_time = step * delta_t;
+
+    // compute forces for local bodies using the current global_positions & masses
+    for (int i = 0; i < local_n; ++i) {
+        int global_index = displs[rank] + i; // global index
+        compute_local_forces(global_index, global_positions, masses, local_forces[i], n_particles);
+    }
+
+    // update local velocities and positions for local bodies
+    for (int i = 0; i < local_n; ++i) {
+        // v += a * dt  ; a = F/m
+        local_velocities[i].X += local_forces[i].X / masses[displs[rank] + i] * delta_t;
+        local_velocities[i].Y += local_forces[i].Y / masses[displs[rank] + i] * delta_t;
+        local_velocities[i].Z += local_forces[i].Z / masses[displs[rank] + i] * delta_t;
+
+        // s += v * dt
+        local_positions[i].X += local_velocities[i].X * delta_t;
+        local_positions[i].Y += local_velocities[i].Y * delta_t;
+        local_positions[i].Z += local_velocities[i].Z * delta_t;
+    }
+
+    ...
+}
+```
+
+### Gather results on root
+
+Once the forces are computed, each process updates the velocity and postion of its local particles. Then, all ranks refresh their copy of the global particle arrays, so that the next force computation can use the latest state using `MPI_Allgatherv`, which gathers the blocks from all processes and distributes the complete result back to everyone.
+
+Only the root process writes the simulation states to the output file for later visualization to avoid duplicated output.
+
+```cpp
+for (int step = 1; step <= n_steps; ++step) {
+    
+    ...
+
+    // Gather results on root
+    MPI_Allgatherv(local_positions, counts[rank], mpi_vector_type,
+        global_positions, counts, displs, mpi_vector_type, MPI_COMM_WORLD);
+
+    MPI_Allgatherv(local_velocities, counts[rank], mpi_vector_type,
+        global_velocities, counts, displs, mpi_vector_type, MPI_COMM_WORLD);
+
+    if (rank == 0 && (step % 100 == 0)) {
+        write_state(out_file, step, current_time, global_positions, masses, n_particles);
+    }
+}
+```
+
+### Cleanup
+
+After the simulation computation is complete and all results have been written, each process frees the memory it allocated during the setup phase:
+
+```cpp
+delete[] counts;
+delete[] displs;
+delete[] local_positions;
+delete[] local_velocities;
+delete[] local_forces;
+delete[] global_positions;
+delete[] global_velocities;
+delete[] masses;
+```
+
+Additionally, the custom MPI datatype created for representing the `Vector` struct must be freed:
+
+```cpp
+MPI_Type_free(&mpi_vector_type);
+```
+
+And lastly, the program terminates the MPI environment with
+
+```cpp
+MPI_Finalize();
+```

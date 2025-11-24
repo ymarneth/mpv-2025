@@ -2,17 +2,12 @@
 #include <random>
 #include <fstream>
 #include <chrono>
+#include <mpi.h>
 
 struct Vector {
     double X;
     double Y;
     double Z;
-};
-
-struct Particle {
-    double m;
-    Vector s; // position
-    Vector v; // velocity
 };
 
 const double G = 6.6743e-11;
@@ -22,207 +17,192 @@ int n_particles = 25;
 
 double delta_t = 1e4; // hours
 
-void generate_initial_state(Particle* particles) {
+MPI_Datatype mpi_vector_type;
+MPI_Datatype mpi_particle_type;
+
+void build_vector_type() {
+    int blocklens[3] = { 1, 1, 1 };
+    MPI_Aint disps[3];
+    MPI_Datatype types[3] = { MPI_DOUBLE, MPI_DOUBLE, MPI_DOUBLE };
+
+    Vector probe{};
+    MPI_Aint base;
+    MPI_Get_address(&probe, &base);
+    MPI_Get_address(&probe.X, &disps[0]);
+    MPI_Get_address(&probe.Y, &disps[1]);
+    MPI_Get_address(&probe.Z, &disps[2]);
+    disps[0] -= base; disps[1] -= base; disps[2] -= base;
+
+    MPI_Datatype tmp;
+    MPI_Type_create_struct(3, blocklens, disps, types, &tmp);
+    
+    // Ensure arrays of Vector advance by sizeof(Vector)
+    MPI_Type_create_resized(tmp, 0, sizeof(Vector), &mpi_vector_type);
+    MPI_Type_commit(&mpi_vector_type);
+    MPI_Type_free(&tmp);
+}
+
+void generate_initial_state(Vector* positions, Vector* velocities, double* masses, int n) {
     std::default_random_engine generator{ 42 };
 
     std::lognormal_distribution<double> mass_distribution{ std::log(1e25), 0.8 };
     std::uniform_real_distribution<double> position_distribution{ -1e11, +1e11 };
     std::normal_distribution<double> velocity_distribution{ 0.0, 1e2 };
 
-    for (int q = 0; q < n_particles; q++) {
-        particles[q].m = mass_distribution(generator);
+    for (int q = 0; q < n; q++) {
+        masses[q] = mass_distribution(generator);
 
-        particles[q].s.X = position_distribution(generator);
-        particles[q].s.Y = position_distribution(generator);
-        particles[q].s.Z = position_distribution(generator);
+        positions[q].X = position_distribution(generator);
+        positions[q].Y = position_distribution(generator);
+        positions[q].Z = position_distribution(generator);
 
-        particles[q].v.X = velocity_distribution(generator);
-        particles[q].v.Y = velocity_distribution(generator);
-        particles[q].v.Z = velocity_distribution(generator);
+        velocities[q].X = velocity_distribution(generator);
+        velocities[q].Y = velocity_distribution(generator);
+        velocities[q].Z = velocity_distribution(generator);
     }
 }
 
-void calculate_forces_simple(int q, Particle* particles, Vector* forces) {
-    forces[q].X = forces[q].Y = forces[q].Z = 0.0;
+void compute_local_forces(int global_index, const Vector* global_positions, const double* masses, Vector& forces, int n_total) {
+    forces.X = forces.Y = forces.Z = 0.0;
 
-    for (int k = 0; k < n_particles; k++) {
-        if (k == q) continue;
+    const Vector& pos_i = global_positions[global_index];
 
-        double dx = particles[q].s.X - particles[k].s.X;
-        double dy = particles[q].s.Y - particles[k].s.Y;
-        double dz = particles[q].s.Z - particles[k].s.Z;
+    for (int k = 0; k < n_total; ++k) {
+        if (k == global_index) continue;
+
+        const Vector& pos_k = global_positions[k];
+
+        double dx = pos_i.X - pos_k.X;
+        double dy = pos_i.Y - pos_k.Y;
+        double dz = pos_i.Z - pos_k.Z;
 
         double r2 = dx * dx + dy * dy + dz * dz;
-        double r1 = sqrt(r2);
-        double r3 = r2 * r1;
+        double r1 = std::sqrt(r2);
+        double r3 = r2 * r1 + 1e-30; // avoid division by zero
 
-        double mass_force = particles[k].m / r3;
+        double mass_force = masses[k] / r3;
 
-        forces[q].X += mass_force * dx;
-        forces[q].Y += mass_force * dy;
-        forces[q].Z += mass_force * dz;
+        forces.X += mass_force * dx;
+        forces.Y += mass_force * dy;
+        forces.Z += mass_force * dz;
     }
 
-    forces[q].X *= -G;
-    forces[q].Y *= -G;
-    forces[q].Z *= -G;
-}
-
-void update_position(int q, Particle* particles, Vector* forces) {
-    particles[q].s.X += particles[q].v.X * delta_t;
-    particles[q].s.Y += particles[q].v.Y * delta_t;
-    particles[q].s.Z += particles[q].v.Z * delta_t;
-
-    particles[q].v.X += forces[q].X / particles[q].m * delta_t;
-    particles[q].v.Y += forces[q].Y / particles[q].m * delta_t;
-    particles[q].v.Z += forces[q].Z / particles[q].m * delta_t;
+    forces.X *= -G;
+    forces.Y *= -G;
+    forces.Z *= -G;
 }
 
 void write_header(std::ostream& output) {
     output << "Step;Time;Particle;Position_X;Position_Y;Position_Z;Mass\n";
 }
 
-void write_state(std::ostream& output, int step, double time, Particle* particles) {
-    for (int q = 0; q < n_particles; q++) {
+void write_state(std::ostream& output, int step, double time, const Vector* positions, const double* masses, int n) {
+    for (int q = 0; q < n; q++) {
         output << step << ";" << time << ";" << q << ";"
-            << particles[q].s.X << ";" << particles[q].s.Y << ";" << particles[q].s.Z << ";"
-            << particles[q].m << "\n";
+            << positions[q].X << ";" << positions[q].Y << ";" << positions[q].Z << ";"
+            << masses[q] << "\n";
     }
 }
 
-void write_header_stats(std::ostream& output) {
-    output << "Version;Implementation;Thread Number;Trial;Time (ms);Avg Sequential Time (ms);Speedup (x);Efficiency (%)\n";
-}
+int main(int argc, char** argv)
+{
+    MPI_Init(&argc, &argv);
+    build_vector_type();
 
-void write_run_stats(std::ostream& output, bool parallel, int thread_num, int trial, double time) {
-    const std::string version = "Simple";
-    const std::string impl = parallel ? "parallel" : "sequential";
+    int rank = 0, comm_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
 
-    output << version << ';'
-        << impl << ';'
-        << thread_num << ';'
-        << trial << ';'
-        << time << ';' << '\n';
-}
+    // distribute particles to processes
+    int base_particles = n_particles / comm_size;
+    int remaining_particles = n_particles % comm_size;
+    int local_n = base_particles + (rank < remaining_particles ? 1 : 0);
 
-void write_run_stats_summary(std::ostream& output, bool parallel, int thread_num, double avgSeqTime) {
-    const std::string version = "Simple";
-    const std::string impl = parallel ? "parallel" : "sequential";
+    int* counts = new int[comm_size];
+    int* displs = new int[comm_size];
+    displs[0] = 0;
+    for (int p = 0; p < comm_size; ++p) {
+        counts[p] = base_particles + (p < remaining_particles ? 1 : 0);
+        if (p > 0) displs[p] = displs[p - 1] + counts[p - 1];
+    }
 
-    output << version << ';'
-        << impl << ';'
-        << thread_num << ';'
-        << ';'
-        << ';'
-        << avgSeqTime
-        << '\n';
-}
+    // global buffers (only filled on rank 0).
+    Vector* global_positions = new Vector[n_particles];
+    Vector* global_velocities = new Vector[n_particles];
+    double* masses = new double[n_particles];
 
-void run_simulation_simple() {
-    auto* particles = new Particle[n_particles];
-    generate_initial_state(particles);
+    // local buffers
+    Vector* local_positions = new Vector[local_n];
+    Vector* local_velocities = new Vector[local_n];
+    Vector* local_forces = new Vector[local_n];
 
-    std::ofstream out_file{ "n_body_simple.csv", std::ios::out };
-    write_header(out_file);
-    write_state(out_file, 0, 0.0, particles);
+    std::ofstream out_file{ "n_body_simple_mpi.csv", std::ios::out };
+    if (rank == 0) {
+        write_header(out_file);
+        
+        generate_initial_state(global_positions, global_velocities, masses, n_particles);
+        
+        write_state(out_file, 0, 0.0, global_positions, masses, n_particles);
+    }
 
-    auto* forces = new Vector[n_particles];
+    MPI_Bcast(masses, n_particles, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-    for (int step = 1; step <= n_steps; step++) {
+    // broadcast initial global_positions and velocities so every rank can compute forces in first step
+    MPI_Bcast(global_positions, n_particles, mpi_vector_type, 0, MPI_COMM_WORLD);
+    MPI_Bcast(global_velocities, n_particles, mpi_vector_type, 0, MPI_COMM_WORLD);
+
+    // copy initial local slices from global arrays (local view)
+    MPI_Scatterv(global_positions, counts, displs, mpi_vector_type,
+        local_positions, counts[rank], mpi_vector_type, 0, MPI_COMM_WORLD);
+
+    MPI_Scatterv(global_velocities, counts, displs, mpi_vector_type,
+        local_velocities, counts[rank], mpi_vector_type, 0, MPI_COMM_WORLD);
+
+    for (int step = 1; step <= n_steps; ++step) {
         double current_time = step * delta_t;
 
-        // calculate forces
-        for (int q = 0; q < n_particles; q++) {
-            calculate_forces_simple(q, particles, forces);
+        // compute forces for local bodies using the current global_positions & masses
+        for (int i = 0; i < local_n; ++i) {
+            int global_index = displs[rank] + i; // global index
+            compute_local_forces(global_index, global_positions, masses, local_forces[i], n_particles);
         }
 
-        // position updates
-        for (int q = 0; q < n_particles; q++) {
-            update_position(q, particles, forces);
+        // update local velocities and positions for local bodies
+        for (int i = 0; i < local_n; ++i) {
+            // v += a * dt  ; a = F/m
+            local_velocities[i].X += local_forces[i].X / masses[displs[rank] + i] * delta_t;
+            local_velocities[i].Y += local_forces[i].Y / masses[displs[rank] + i] * delta_t;
+            local_velocities[i].Z += local_forces[i].Z / masses[displs[rank] + i] * delta_t;
+
+            // s += v * dt
+            local_positions[i].X += local_velocities[i].X * delta_t;
+            local_positions[i].Y += local_velocities[i].Y * delta_t;
+            local_positions[i].Z += local_velocities[i].Z * delta_t;
         }
 
-        // write results
-        if (step % 100 == 0) {
-            write_state(out_file, step, current_time, particles);
-        }
-    }
+        // Gather results on root
+        MPI_Allgatherv(local_positions, counts[rank], mpi_vector_type,
+            global_positions, counts, displs, mpi_vector_type, MPI_COMM_WORLD);
 
-    delete[] particles;
-    delete[] forces;
-}
+        MPI_Allgatherv(local_velocities, counts[rank], mpi_vector_type,
+            global_velocities, counts, displs, mpi_vector_type, MPI_COMM_WORLD);
 
-void run_simulation_simple_parallel(int thread_num) {
-    auto* particles = new Particle[n_particles];
-    generate_initial_state(particles);
-
-    std::ofstream out_file{ "n_body_simple.csv", std::ios::out };
-    write_header(out_file);
-    write_state(out_file, 0, 0.0, particles);
-
-    auto* forces = new Vector[n_particles];
-
-    for (int step = 1; step <= n_steps; step++) {
-        double current_time = step * delta_t;
-
-        // calculate forces
-#pragma omp parallel for num_threads(thread_num)
-        for (int q = 0; q < n_particles; q++) {
-            calculate_forces_simple(q, particles, forces);
-        }
-
-        // position updates
-        for (int q = 0; q < n_particles; q++) {
-            update_position(q, particles, forces);
-        }
-
-        // write results
-        if (step % 100 == 0) {
-            write_state(out_file, step, current_time, particles);
+        if (rank == 0 && (step % 100 == 0)) {
+            write_state(out_file, step, current_time, global_positions, masses, n_particles);
         }
     }
 
-    delete[] particles;
-    delete[] forces;
-}
+    delete[] counts;
+    delete[] displs;
+    delete[] local_positions;
+    delete[] local_velocities;
+    delete[] local_forces;
+    delete[] global_positions;
+    delete[] global_velocities;
+    delete[] masses;
 
-double measure_time(bool parallel, int thread_num) {
-    auto start = std::chrono::high_resolution_clock::now();
-
-        if (parallel)
-            run_simulation_simple_parallel(thread_num);
-        else
-            run_simulation_simple();
-
-    auto end = std::chrono::high_resolution_clock::now();
-    return std::chrono::duration<double, std::milli>(end - start).count();
-}
-
-void run_experiment(bool parallel, int thread_num, int trials, std::ostream& output) {
-    double total_time = 0.0;
-
-    for (int i = 0; i < trials; i++) {
-        double time_ms = measure_time(parallel, thread_num);
-        write_run_stats(output, parallel, thread_num, i + 1, time_ms);
-        total_time += time_ms;
-    }
-
-    double average_time = total_time / trials;
-    write_run_stats_summary(output, parallel, thread_num, average_time);
-}
-
-int main__nbody() {
-    constexpr int trials = 10;
-
-    std::ofstream out_file{ "n_body_stats.csv", std::ios::out };
-    write_header_stats(out_file);
-
-    std::cout << "=== Running Sequential Simple Version ===" << std::endl;
-    run_experiment(false, 1, trials, out_file);
-
-    //for (int numThreadsValues[] = { 2, 4, 8 }; const int numThreads : numThreadsValues) {
-    //    std::cout << std::format("=== Running Parallel Simple Version ({} threads) ===\n", numThreads);
-    //    run_experiment(true, numThreads, trials, out_file);
-    //}
-
+    MPI_Type_free(&mpi_vector_type);
+    MPI_Finalize();
+    
     return 0;
 }
