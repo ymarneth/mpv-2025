@@ -145,7 +145,7 @@ int potato = -1;
 
 ### Role of root (Rank 0)
 
-Rank 0 then generates the potato using the `default_random_engine` that was previously prepared to a number between 20 and 50 and chooses a random receiver
+Rank 0 then generates the potato using the `default_random_engine` that was previously prepared to a number between 20 and 50 and chooses a random receiver using `MPI_Send`. To ensure the potato is not sent the same rank, it is wrapped in a do-while loop.
 
 ```cpp
 if (rank == 0) {
@@ -168,6 +168,8 @@ if (rank == 0) {
 ```
 
 ### Receiving the potato
+
+Then, all processes, including rank 0, wait to receive the potato. Since the reveiver of the patato is randomly chosen, `MPI_ANY_SOURCE` is used for the `from` property. The `MPI_Recv` is also wrapped in a while-loop to keep the processes ready to receive the potato multiple times in one game. This is controlled by the `game_running` variable. If the potato is sent with a value of `-1` the game is ended and the loop is broken. -1 was chosen as the end signal and ensures all processes stop waiting to receive the potato.
 
 ```cpp
 while (game_running) {
@@ -192,6 +194,8 @@ while (game_running) {
 ```
 
 ### Passing the potato along
+
+However, as long as the potato value is greater than 0, the receiver simply reduces the value by 1 and passes it along to the next randomly chosen process. This happens in the same manner as in the beginning for process 0.
 
 ```cpp
 if (potato > 0) {
@@ -218,6 +222,8 @@ if (potato > 0) {
 ```
 
 ### Ending the game
+
+As soon as the potato value reaches 0, the loser of the Hot Potato game is announced, the `game_running` is set to false and the ending signal is sent to all other processes, except to the rank itself, allowing the program to gracefully stop. `MPI_Finalize` is called last to ensure that the MPI environment is cleaned up.
 
 ```cpp
 if (potato > 0) {
@@ -330,7 +336,13 @@ Process 3 has lost
 
 ### Part 1: Rows match number of processes
 
+In this first version of the matrix-vector multiplication, the total number of matrix rows matches the number of MPI processes, allowing the program to evenly distribute the the rows to the processes. Each process receives exactly the same number of rows.
+
 #### Initialization
+
+As in the previous exercises, the MPI environment is initialized before any communication can be established. When this is done, the dimensions of the matrix and vector are then defined. Here, `M` is the number of rows of the matrix and is set to a very large value, while `N`, the number of columns, is very small. This setup creates a tall and narrow matrix, allowing MPI to optimize the runtime effectively.
+
+To generate reproducible data, a fixed seed is used for the random-number generator. A uniform real distribution in the range `[-1.0, +1.0]` is chosen for both the matrix entries and the vector elements.
 
 ```cpp
 MPI_Init(&argc, &argv);
@@ -346,6 +358,8 @@ std::uniform_real_distribution<double> dist{ -1.0, +1.0 };
 ```
 
 #### Broadcast x
+
+Before the multiplication process can begin, every process needs to be able to access the same vector `x`. Since only the root process with rank 0 generates the vector, it must be distributed to all other processes using `MPI_Bcast`. After this call completes, every process holds an identical copy of the vector, ensuring that the local matrix-vector multiplications performed later are consistent.
 
 ```cpp
 double* x = new double[N];
@@ -369,6 +383,14 @@ MPI_Bcast(
 ```
 
 #### Scatter A
+
+The matrix `A` must be divided among the available processes so that each process computes only a portion of the final result. In this first version, the total number of rows `M` is chosen to divide evenly among the numer of process, so every process gets the same number of rows.
+
+The root process begins by generating the full matrix of `A` and fills it with random values. All other processes leave their pointar as `nullptr`, since they will only receive their portion of the matrix.
+
+The number of rows each process should handle is computed as `rows_perprocessor = M / comm_size`. Then each process allocates a local buffer called `local_A`, which is large enough to store its share of the matrix. Since each row contains `N` entries, the local buffer size is `rows_per_processor * N`.
+
+The actual distribution of the matrix is performed via `MPI_Scatter`, which sends contiguous blocks of data from the root process to every other process, including root itself. After scattering, the root process no longer needs the full matrix and can free the memory.
 
 ```cpp
 double* A = nullptr;
@@ -402,6 +424,10 @@ if (rank == 0) {
 
 #### Calculate local y
 
+Once each process has received the necessary data, it can begin computing its part of the final output vector `y`. A local result array `local_y` is allocated with one entry for each row assigned to the process. The matrix-vector multiplication is then performed row by row. For every local row, a dot product between the corresponding matrix row and the vector `x` is computed.
+
+After the computation is finished, and since the matrix slice `local_A` and the broadcasted vector `x` are no longer needed, both buffers are freed.
+
 ```cpp
 std::cout << "P " << rank << " starts calculating...\n" << std::flush;
 
@@ -419,6 +445,10 @@ delete[] x;
 ```
 
 #### Gather local results to root process
+
+After every process computes its partial result, the final step is to collect these partial vectors into a single output vector on the root process. This is done using `MPI_Gather`, the counterpart of `MPI_Scatter`.
+
+The root process first allocates enough memory to hold the entire result vector `y`. Then, `MPI_Gather` collects each `local_y` buffer and places them in the correct order in `y`. After the gather operation is done, each process frees its `local_y` buffer. Only the root process keeps the full vector `y`.
 
 ```cpp
 double* y = nullptr;
@@ -442,6 +472,10 @@ delete[] local_y;
 
 #### Finalize
 
+In the end, the root process prints a small subset of the result vector as a quick confirmation that the operation produced useful output. Printing the entire result would be excessive for matrices of this size.
+
+Once printing is complete, the root process frees the memory used for the full result vector. All processes then call `MPI_Finalize` to cleanly shut down the MPI environment.
+
 ```cpp
 if (rank == 0) {
     std::cout << "Result: " << std::flush;
@@ -457,7 +491,15 @@ MPI_Finalize();
 
 ### Part 2: Rows don't match number of processes
 
+Since the number of rows `M` in the matrix `A` may not always divide evenly between the number of available processes, the simple `MPI_Scatter` approach is insufficient since it requires that every process receives the same number of elements. To support any matrix size, a more flexible scatter operation is required.
+
 ####  Handle scatter with `MPI_Scatterv`
+
+The approach begins by computing how many rows each process should receive. Most processes get `base_rows = M / comm_size`, while the first `remainder_rows = M % comm_size` processes reveive one additional row each. This ensures that the total number of rows is distributed as evenly as possible.
+
+To effectively scatter this, `MPI_Scatterv` is used in place of the simple `MPI_Scatter`. This requires three arrays to be constructed: `sendcounts` defines how many elements each process receives, `displs` where each block starts within the original matrix and `rows_for_process` the number of rows assigned to each process.
+
+`MPI_Scatterv` then distributes the parts of the amtrix accordingly. Unlike the basic scatter, this function allows each process to receive a differtly sized segment of data.
 
 ```cpp
 int base_rows = M / comm_size;
@@ -491,7 +533,14 @@ MPI_Scatterv(
     MPI_COMM_WORLD
 );
 ```
+
 #### Handle gather with `MPI_Gatherv`
+
+After each process has computed its portion of the output vector, the partial results must again be assembled back into the final result array `y` on the root process. Since the number of rows assigned to each process may differ, the basic `MPI_Gather` can also not be used here, so `MPI_Gatherv` is used here.
+
+It needs two arrays to define how the results should be placed in the final output: `recvcounts_y` defines how many output entries ach process contributes and `displs_y` the position where each block of results should be stored. These arrays are build based on `rows_for_process`, ensuring that the gathered values appear in the correct order in the global result vector.
+
+After gathering, the temporary buffers and bookkeeping arrays are freed.
 
 ```cpp
 int* recvcounts_y = new int[comm_size];

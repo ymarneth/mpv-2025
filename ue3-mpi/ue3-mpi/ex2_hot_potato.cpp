@@ -4,7 +4,7 @@
 #include <format>
 #include <chrono>
 
-int main(int argc, char** argv)
+int main__potato(int argc, char** argv)
 {
     MPI_Init(&argc, &argv);
 
