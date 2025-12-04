@@ -1,8 +1,10 @@
 #include <iostream>
 #include <mpi.h>
 #include <random>
+#include <algorithm>
+#include <vector>
 
-int main(int argc, char **argv)
+int main(int argc, char** argv)
 {
     MPI_Init(&argc, &argv);
 
@@ -10,44 +12,35 @@ int main(int argc, char **argv)
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    int ROUNDS = 10;
+    int ROUNDS = 100;
 
     const int HUMAN = 0, ZOMBIE = 1;
     const int STAY = 0, UP = 1, DOWN = 2, LEFT = 3, RIGHT = 4;
 
-    const int GLOBAL_ROWS = 4;
-    const int GLOBAL_COLS = 4;
+    const int GLOBAL_ROWS = 128;
+    const int GLOBAL_COLS = 128;
 
-    std::default_random_engine gen{42 + (unsigned int)rank};
-    std::uniform_int_distribution<int> dist{HUMAN, ZOMBIE};
-    std::uniform_int_distribution<int> move_dist{0, 3}; // 0=stay, 1=up, 2=down, 3=left, 4=right
+    std::default_random_engine gen{ 42 + (unsigned int)rank };
+    std::uniform_int_distribution<int> dist{ HUMAN, ZOMBIE };
+    std::uniform_int_distribution<int> move_dist{ 0, 4 }; // 0=stay,1=up,2=down,3=left,4=right
 
     // Create process grid topology
-    int dims[2] = {0, 0};
+    int dims[2] = { 0, 0 };
     MPI_Dims_create(size, 2, dims);
 
-    int periods[2] = {0, 0}; // No wraparound
+    int periods[2] = { 0, 0 }; // No wraparound
     MPI_Comm grid_comm;
-
-    MPI_Cart_create(
-        MPI_COMM_WORLD,
-        2, // 2D grid
-        dims,
-        periods,
-        /*reorder*/ 1,
-        &grid_comm);
+    MPI_Cart_create(MPI_COMM_WORLD, 2, dims, periods, /*reorder*/ 1, &grid_comm);
 
     int coords[2];
     MPI_Cart_coords(grid_comm, rank, 2, coords);
 
-    // Calculate local grid dimensions for this process
+    // Calculate local grid dimensions (block distribution with remainder)
     int local_rows = GLOBAL_ROWS / dims[0];
     int local_cols = GLOBAL_COLS / dims[1];
 
-    if (coords[0] < GLOBAL_ROWS % dims[0])
-        local_rows++;
-    if (coords[1] < GLOBAL_COLS % dims[1])
-        local_cols++;
+    if (coords[0] < GLOBAL_ROWS % dims[0]) local_rows++;
+    if (coords[1] < GLOBAL_COLS % dims[1]) local_cols++;
 
     int start_row = coords[0] * (GLOBAL_ROWS / dims[0]) + std::min(coords[0], GLOBAL_ROWS % dims[0]);
     int start_col = coords[1] * (GLOBAL_COLS / dims[1]) + std::min(coords[1], GLOBAL_COLS % dims[1]);
@@ -56,149 +49,179 @@ int main(int argc, char **argv)
     MPI_Cart_shift(grid_comm, 1, 1, &left, &right); // horizontal neighbors
     MPI_Cart_shift(grid_comm, 0, 1, &up, &down);    // vertical neighbors
 
-    int **local_grid = new int *[local_rows + 2];
-    int **new_local_grid = new int *[local_rows + 2];
+    // allocate with halo: (local_rows + 2) x (local_cols + 2)
+    std::vector<int> backing((local_rows + 2) * (local_cols + 2), HUMAN);
+    std::vector<int> new_backing((local_rows + 2) * (local_cols + 2), HUMAN);
 
-    for (int i = 0; i < local_rows + 2; i++)
-    {
-        local_grid[i] = new int[local_cols + 2];
-        new_local_grid[i] = new int[local_cols + 2];
-    }
+    auto idx = [&](int i, int j) { return i * (local_cols + 2) + j; };
 
-    for (int i = 1; i <= local_rows; i++)
-    {
-        for (int j = 1; j <= local_cols; j++)
-        {
-            local_grid[i][j] = dist(gen);
-        }
-    }
+    int* local_grid = backing.data();
+    int* new_local_grid = new_backing.data();
 
-    if (rank == 0)
-    {
+    // initialize interior randomly
+    for (int i = 1; i <= local_rows; ++i)
+        for (int j = 1; j <= local_cols; ++j)
+            local_grid[idx(i, j)] = dist(gen);
+
+    if (rank == 0) {
         std::cout << "Grid dimensions: " << GLOBAL_ROWS << "x" << GLOBAL_COLS << std::endl;
         std::cout << "Process grid: " << dims[0] << "x" << dims[1] << std::endl;
         std::cout << "Starting zombie outbreak simulation with " << size << " processes" << std::endl;
     }
 
     std::cout << "Process " << rank << " (" << coords[0] << "," << coords[1] << ") manages "
-              << local_rows << "x" << local_cols << " section starting at ("
-              << start_row << "," << start_col << ")" << std::endl;
+        << local_rows << "x" << local_cols << " section starting at ("
+        << start_row << "," << start_col << ")" << std::endl;
 
-    for (int round = 0; round < ROUNDS; round++)
+    // --- create derived datatypes for halos ---
+    MPI_Datatype col_type, row_type;
+    // column: local_rows elements, stride = local_cols+2 (full row length)
+    MPI_Type_vector(local_rows, 1, local_cols + 2, MPI_INT, &col_type);
+    MPI_Type_commit(&col_type);
+
+    // row: contiguous local_cols ints
+    MPI_Type_contiguous(local_cols, MPI_INT, &row_type);
+    MPI_Type_commit(&row_type);
+
+    // tags
+    const int TAG_LEFT = 10;
+    const int TAG_RIGHT = 11;
+    const int TAG_UP = 20;
+    const int TAG_DOWN = 21;
+
+    constexpr int score_lookup[2][2] = {
+        /*HUMAN,ZOMBIE*/ { HUMAN, ZOMBIE },
+        /*ZOMBIE,HUMAN*/ { ZOMBIE, ZOMBIE }
+    }; // (not used but kept for clarity)
+
+    for (int round = 0; round < ROUNDS; ++round)
     {
-        MPI_Request requests[8];
-        int req_count = 0;
+        // --- halo exchange using derived types and non-blocking calls ---
+        std::vector<MPI_Request> requests;
+        requests.reserve(8);
 
-        if (left != MPI_PROC_NULL)
-        {
-            for (int i = 1; i <= local_rows; i++)
-            {
-                MPI_Isend(&local_grid[i][1], 1, MPI_INT, left, 0, grid_comm, &requests[req_count++]);
-                MPI_Irecv(&local_grid[i][0], 1, MPI_INT, left, 0, grid_comm, &requests[req_count++]);
-            }
+        // left/right: send/recv columns
+        if (left != MPI_PROC_NULL) {
+            // send leftmost interior column (col=1) to left neighbor -> they will receive into their right halo
+            MPI_Request req;
+            MPI_Isend(&local_grid[idx(1, 1)], 1, col_type, left, TAG_LEFT, grid_comm, &req);
+            requests.push_back(req);
+            MPI_Irecv(&local_grid[idx(1, 0)], 1, col_type, left, TAG_RIGHT, grid_comm, &req); // receive their rightmost col into our left halo
+            requests.push_back(req);
+        }
+        if (right != MPI_PROC_NULL) {
+            MPI_Request req;
+            MPI_Isend(&local_grid[idx(1, local_cols)], 1, col_type, right, TAG_RIGHT, grid_comm, &req);
+            requests.push_back(req);
+            MPI_Irecv(&local_grid[idx(1, local_cols + 1)], 1, col_type, right, TAG_LEFT, grid_comm, &req);
+            requests.push_back(req);
         }
 
-        if (right != MPI_PROC_NULL)
-        {
-            for (int i = 1; i <= local_rows; i++)
-            {
-                MPI_Isend(&local_grid[i][local_cols], 1, MPI_INT, right, 0, grid_comm, &requests[req_count++]);
-                MPI_Irecv(&local_grid[i][local_cols + 1], 1, MPI_INT, right, 0, grid_comm, &requests[req_count++]);
-            }
+        // up/down: send/recv rows
+        if (up != MPI_PROC_NULL) {
+            MPI_Request req;
+            MPI_Isend(&local_grid[idx(1, 1)], 1, row_type, up, TAG_UP, grid_comm, &req);
+            requests.push_back(req);
+            MPI_Irecv(&local_grid[idx(0, 1)], 1, row_type, up, TAG_DOWN, grid_comm, &req);
+            requests.push_back(req);
+        }
+        if (down != MPI_PROC_NULL) {
+            MPI_Request req;
+            MPI_Isend(&local_grid[idx(local_rows, 1)], 1, row_type, down, TAG_DOWN, grid_comm, &req);
+            requests.push_back(req);
+            MPI_Irecv(&local_grid[idx(local_rows + 1, 1)], 1, row_type, down, TAG_UP, grid_comm, &req);
+            requests.push_back(req);
         }
 
-        if (up != MPI_PROC_NULL)
-        {
-            MPI_Isend(&local_grid[1][1], local_cols, MPI_INT, up, 1, grid_comm, &requests[req_count++]);
-            MPI_Irecv(&local_grid[0][1], local_cols, MPI_INT, up, 1, grid_comm, &requests[req_count++]);
-        }
+        if (!requests.empty())
+            MPI_Waitall((int)requests.size(), requests.data(), MPI_STATUSES_IGNORE);
 
-        if (down != MPI_PROC_NULL)
-        {
-            MPI_Isend(&local_grid[local_rows][1], local_cols, MPI_INT, down, 1, grid_comm, &requests[req_count++]);
-            MPI_Irecv(&local_grid[local_rows + 1][1], local_cols, MPI_INT, down, 1, grid_comm, &requests[req_count++]);
-        }
-
-        MPI_Waitall(req_count, requests, MPI_STATUSES_IGNORE);
-
-        for (int i = 1; i <= local_rows; i++)
-        {
-            for (int j = 1; j <= local_cols; j++)
-            {
+        // --- infection update (only orthogonal neighbors) ---
+        for (int i = 1; i <= local_rows; ++i) {
+            for (int j = 1; j <= local_cols; ++j) {
                 int zombie_neighbors = 0;
+                if (local_grid[idx(i - 1, j)] == ZOMBIE) ++zombie_neighbors; // up
+                if (local_grid[idx(i + 1, j)] == ZOMBIE) ++zombie_neighbors; // down
+                if (local_grid[idx(i, j - 1)] == ZOMBIE) ++zombie_neighbors; // left
+                if (local_grid[idx(i, j + 1)] == ZOMBIE) ++zombie_neighbors; // right
 
-                for (int di = -1; di <= 1; di++)
-                {
-                    for (int dj = -1; dj <= 1; dj++)
-                    {
-                        if (di == 0 && dj == 0)
-                            continue;
-                        if (local_grid[i + di][j + dj] == ZOMBIE)
-                        {
-                            zombie_neighbors++;
-                        }
-                    }
-                }
-
-                new_local_grid[i][j] = local_grid[i][j];
-                if (local_grid[i][j] == HUMAN && zombie_neighbors >= 2)
-                {
-                    new_local_grid[i][j] = ZOMBIE;
+                new_local_grid[idx(i, j)] = local_grid[idx(i, j)];
+                if (local_grid[idx(i, j)] == HUMAN && zombie_neighbors >= 2) {
+                    new_local_grid[idx(i, j)] = ZOMBIE;
                 }
             }
         }
 
-        // Random movement within local boundaries
-        for (int i = 1; i <= local_rows; i++)
-        {
-            for (int j = 1; j <= local_cols; j++)
-            {
-                int move = move_dist(gen);
-                int new_i = i, new_j = j;
+        // --- movement: apply moves to moved_local_grid (first-writer wins on collisions) ---
+        // Use sentinel -1 to indicate empty in moved grid
+        std::vector<int> moved_backing((local_rows + 2) * (local_cols + 2), -1);
+        int* moved_local_grid = moved_backing.data();
 
-                switch (move)
-                {
-                case 1:
-                    new_i = std::max(1, i - 1);
-                    break; // up
-                case 2:
-                    new_i = std::min(local_rows, i + 1);
-                    break; // down
-                case 3:
-                    new_j = std::max(1, j - 1);
-                    break; // left
-                case 4:
-                    new_j = std::min(local_cols, j + 1);
-                    break; // right
-                default:
+        for (int i = 1; i <= local_rows; ++i) {
+            for (int j = 1; j <= local_cols; ++j) {
+                int val = new_local_grid[idx(i, j)]; // use post-infection value
+                int mv = move_dist(gen);
+                int ti = i, tj = j;
+
+                switch (mv) {
+                case UP:    ti = std::max(1, i - 1); break;
+                case DOWN:  ti = std::min(local_rows, i + 1); break;
+                case LEFT:  tj = std::max(1, j - 1); break;
+                case RIGHT: tj = std::min(local_cols, j + 1); break;
+                default: break; // STAY
+                }
+
+                // write into interior only (1..local_rows,1..local_cols)
+                if (moved_local_grid[idx(ti, tj)] == -1) {
+                    moved_local_grid[idx(ti, tj)] = val; // first writer wins
+                }
+                else {
+                    // collision: keep existing occupant (first-writer). We do nothing.
+                }
+            }
+        }
+
+        // For any cell not written (== -1), fall back to the pre-movement value (conservative)
+        for (int i = 1; i <= local_rows; ++i)
+            for (int j = 1; j <= local_cols; ++j)
+                if (moved_local_grid[idx(i, j)] == -1)
+                    moved_local_grid[idx(i, j)] = new_local_grid[idx(i, j)];
+
+        // --- compute local change comparing moved_local_grid to previous local_grid ---
+        int local_changed = 0;
+        for (int i = 1; i <= local_rows; ++i) {
+            for (int j = 1; j <= local_cols; ++j) {
+                if (moved_local_grid[idx(i, j)] != local_grid[idx(i, j)]) {
+                    local_changed = 1;
                     break;
                 }
             }
+            if (local_changed) break;
         }
 
-        for (int i = 1; i <= local_rows; i++)
-        {
-            for (int j = 1; j <= local_cols; j++)
-            {
-                local_grid[i][j] = new_local_grid[i][j];
-            }
+        // global convergence check
+        int global_changed = 0;
+        MPI_Allreduce(&local_changed, &global_changed, 1, MPI_INT, MPI_LOR, grid_comm);
+
+        // copy moved grid back into local_grid (including halos remain unchanged for now)
+        for (int i = 1; i <= local_rows; ++i)
+            for (int j = 1; j <= local_cols; ++j)
+                local_grid[idx(i, j)] = moved_local_grid[idx(i, j)];
+
+        if (rank == 0) {
+            std::cout << "Round " << round + 1 << " completed (global_changed=" << global_changed << ")" << std::endl;
         }
 
-        if (rank == 0)
-        {
-            std::cout << "Round " << round + 1 << " completed" << std::endl;
+        if (!global_changed) {
+            if (rank == 0) std::cout << "Converged at round " << round + 1 << std::endl;
+            break;
         }
     }
 
-    for (int i = 0; i < local_rows + 2; i++)
-    {
-        delete[] local_grid[i];
-        delete[] new_local_grid[i];
-    }
-    delete[] local_grid;
-    delete[] new_local_grid;
+    // cleanup
+    MPI_Type_free(&col_type);
+    MPI_Type_free(&row_type);
 
     MPI_Finalize();
-
     return 0;
 }
