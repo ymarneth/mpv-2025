@@ -49,7 +49,7 @@ int main(int argc, char** argv)
     MPI_Cart_shift(grid_comm, 1, 1, &left, &right); // horizontal neighbors
     MPI_Cart_shift(grid_comm, 0, 1, &up, &down);    // vertical neighbors
 
-    // allocate with halo: (local_rows + 2) x (local_cols + 2)
+    // Allocate with halo: (local_rows + 2) x (local_cols + 2)
     std::vector<int> backing((local_rows + 2) * (local_cols + 2), HUMAN);
     std::vector<int> new_backing((local_rows + 2) * (local_cols + 2), HUMAN);
 
@@ -58,7 +58,7 @@ int main(int argc, char** argv)
     int* local_grid = backing.data();
     int* new_local_grid = new_backing.data();
 
-    // initialize interior randomly
+    // Initialize interior randomly
     for (int i = 1; i <= local_rows; ++i)
         for (int j = 1; j <= local_cols; ++j)
             local_grid[idx(i, j)] = dist(gen);
@@ -73,42 +73,37 @@ int main(int argc, char** argv)
         << local_rows << "x" << local_cols << " section starting at ("
         << start_row << "," << start_col << ")" << std::endl;
 
-    // --- create derived datatypes for halos ---
+    // Create derived datatypes for halos
     MPI_Datatype col_type, row_type;
-    // column: local_rows elements, stride = local_cols+2 (full row length)
+    
     MPI_Type_vector(local_rows, 1, local_cols + 2, MPI_INT, &col_type);
     MPI_Type_commit(&col_type);
 
-    // row: contiguous local_cols ints
     MPI_Type_contiguous(local_cols, MPI_INT, &row_type);
     MPI_Type_commit(&row_type);
 
-    // tags
     const int TAG_LEFT = 10;
     const int TAG_RIGHT = 11;
     const int TAG_UP = 20;
     const int TAG_DOWN = 21;
 
-    constexpr int score_lookup[2][2] = {
-        /*HUMAN,ZOMBIE*/ { HUMAN, ZOMBIE },
-        /*ZOMBIE,HUMAN*/ { ZOMBIE, ZOMBIE }
-    }; // (not used but kept for clarity)
-
     for (int round = 0; round < ROUNDS; ++round)
     {
-        // --- halo exchange using derived types and non-blocking calls ---
+        // Halo exchange using derived types and non-blocking calls ---
         std::vector<MPI_Request> requests;
         requests.reserve(8);
 
-        // left/right: send/recv columns
         if (left != MPI_PROC_NULL) {
-            // send leftmost interior column (col=1) to left neighbor -> they will receive into their right halo
+            // Send leftmost interior column to right halo of left neighbor
             MPI_Request req;
             MPI_Isend(&local_grid[idx(1, 1)], 1, col_type, left, TAG_LEFT, grid_comm, &req);
             requests.push_back(req);
-            MPI_Irecv(&local_grid[idx(1, 0)], 1, col_type, left, TAG_RIGHT, grid_comm, &req); // receive their rightmost col into our left halo
+
+            // Receive their rightmost col into our left halo
+            MPI_Irecv(&local_grid[idx(1, 0)], 1, col_type, left, TAG_RIGHT, grid_comm, &req);
             requests.push_back(req);
         }
+        
         if (right != MPI_PROC_NULL) {
             MPI_Request req;
             MPI_Isend(&local_grid[idx(1, local_cols)], 1, col_type, right, TAG_RIGHT, grid_comm, &req);
@@ -117,7 +112,6 @@ int main(int argc, char** argv)
             requests.push_back(req);
         }
 
-        // up/down: send/recv rows
         if (up != MPI_PROC_NULL) {
             MPI_Request req;
             MPI_Isend(&local_grid[idx(1, 1)], 1, row_type, up, TAG_UP, grid_comm, &req);
@@ -136,7 +130,7 @@ int main(int argc, char** argv)
         if (!requests.empty())
             MPI_Waitall((int)requests.size(), requests.data(), MPI_STATUSES_IGNORE);
 
-        // --- infection update (only orthogonal neighbors) ---
+        // Infection update
         for (int i = 1; i <= local_rows; ++i) {
             for (int j = 1; j <= local_cols; ++j) {
                 int zombie_neighbors = 0;
@@ -152,8 +146,7 @@ int main(int argc, char** argv)
             }
         }
 
-        // --- movement: apply moves to moved_local_grid (first-writer wins on collisions) ---
-        // Use sentinel -1 to indicate empty in moved grid
+        // Movement in local_grid
         std::vector<int> moved_backing((local_rows + 2) * (local_cols + 2), -1);
         int* moved_local_grid = moved_backing.data();
 
@@ -168,26 +161,25 @@ int main(int argc, char** argv)
                 case DOWN:  ti = std::min(local_rows, i + 1); break;
                 case LEFT:  tj = std::max(1, j - 1); break;
                 case RIGHT: tj = std::min(local_cols, j + 1); break;
-                default: break; // STAY
+                default: break; // stay
                 }
 
-                // write into interior only (1..local_rows,1..local_cols)
                 if (moved_local_grid[idx(ti, tj)] == -1) {
                     moved_local_grid[idx(ti, tj)] = val; // first writer wins
                 }
                 else {
-                    // collision: keep existing occupant (first-writer). We do nothing.
+                    // do nothing --> collision
                 }
             }
         }
 
-        // For any cell not written (== -1), fall back to the pre-movement value (conservative)
+        // For any cell not written, fall back to the pre-movement value
         for (int i = 1; i <= local_rows; ++i)
             for (int j = 1; j <= local_cols; ++j)
                 if (moved_local_grid[idx(i, j)] == -1)
                     moved_local_grid[idx(i, j)] = new_local_grid[idx(i, j)];
 
-        // --- compute local change comparing moved_local_grid to previous local_grid ---
+        // Compute local change comparing moved_local_grid to previous local_grid
         int local_changed = 0;
         for (int i = 1; i <= local_rows; ++i) {
             for (int j = 1; j <= local_cols; ++j) {
@@ -199,11 +191,11 @@ int main(int argc, char** argv)
             if (local_changed) break;
         }
 
-        // global convergence check
+        // Global convergence check
         int global_changed = 0;
         MPI_Allreduce(&local_changed, &global_changed, 1, MPI_INT, MPI_LOR, grid_comm);
 
-        // copy moved grid back into local_grid (including halos remain unchanged for now)
+        // Copy moved grid back into local_grid
         for (int i = 1; i <= local_rows; ++i)
             for (int j = 1; j <= local_cols; ++j)
                 local_grid[idx(i, j)] = moved_local_grid[idx(i, j)];
@@ -218,7 +210,7 @@ int main(int argc, char** argv)
         }
     }
 
-    // cleanup
+    // Cleanup
     MPI_Type_free(&col_type);
     MPI_Type_free(&row_type);
 
