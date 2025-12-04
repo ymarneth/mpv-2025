@@ -2,7 +2,7 @@
 #include <mpi.h>
 #include <random>
 
-int main(int argc, char** argv)
+int main__rock(int argc, char** argv)
 {
     MPI_Init(&argc, &argv);
     
