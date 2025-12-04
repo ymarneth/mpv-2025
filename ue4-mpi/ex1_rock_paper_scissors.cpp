@@ -2,7 +2,7 @@
 #include <mpi.h>
 #include <random>
 
-int main__rock(int argc, char** argv)
+int main(int argc, char** argv)
 {
     MPI_Init(&argc, &argv);
     
@@ -18,12 +18,21 @@ int main__rock(int argc, char** argv)
     std::default_random_engine gen{ 42 + (unsigned int)rank };
     std::uniform_int_distribution<int> dist{ ROCK, SCISSORS };
 
+    MPI_Comm cart_comm;
+    int dims[1] = { size };
+    int periods[1] = { 1 };
+    MPI_Cart_create(MPI_COMM_WORLD, 1, dims, periods, 0, &cart_comm);
+
+    int cart_rank;
+    MPI_Comm_rank(cart_comm, &cart_rank);
+
+    int left_opponent, right_opponent;
+    MPI_Cart_shift(cart_comm, 0, 1, &left_opponent, &right_opponent);
+
     for (int rounds = 0; rounds < ROUNDS; rounds++) {
         int choice = dist(gen);
         int opponent_choice;
 
-        int left_opponent = (rank - 1 + size) % size;
-        int right_opponent = (rank + 1) % size;
         // send...
 
         /*
@@ -33,7 +42,7 @@ int main__rock(int argc, char** argv)
             MPI_INT,
             right_opponent,
             0,
-            MPI_COMM_WORLD
+            cart_comm
         );
 
         MPI_Recv(
@@ -42,7 +51,7 @@ int main__rock(int argc, char** argv)
             MPI_INT,
             left_opponent,
             0,
-            MPI_COMM_WORLD,
+            cart_comm,
             MPI_STATUS_IGNORE
         );
         */
@@ -59,7 +68,7 @@ int main__rock(int argc, char** argv)
             MPI_INT,
             left_opponent,
             0,
-            MPI_COMM_WORLD,
+            cart_comm,
             MPI_STATUS_IGNORE
             );
             */
@@ -72,7 +81,7 @@ int main__rock(int argc, char** argv)
             MPI_INT,
             right_opponent,
             0,
-            MPI_COMM_WORLD,
+            cart_comm,
             &reqs[0]
         );
 
@@ -82,7 +91,7 @@ int main__rock(int argc, char** argv)
             MPI_INT,
             left_opponent,
             0,
-            MPI_COMM_WORLD,
+            cart_comm,
             &reqs[1]
         );
 
@@ -97,7 +106,7 @@ int main__rock(int argc, char** argv)
         score += score_lookup[choice][opponent_choice];
     }
 
-    std::cout << "Process " << rank << ": " << score << std::endl;
+    std::cout << "Process " << rank << ": " << score << std::endl << std::flush;
 
     MPI_Finalize();
 
